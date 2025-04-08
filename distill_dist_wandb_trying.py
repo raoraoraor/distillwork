@@ -145,11 +145,12 @@ def load_teacher_model(MODEL,TRAIN_DATASET,FLAGS, DATASET_CONFIG, num_input_chan
         sampling=FLAGS.cluster_sampling,
         max_imvote_per_pixel=FLAGS.max_imvote_per_pixel,
         image_feature_dim=getattr(TRAIN_DATASET, 'image_feature_dim', 18)  # 安全访问
-    ).cuda()
-    
+    ).cuda()  #学生模型原文：net = net.cuda(local_rank)#
+    '''
     checkpoint = torch.load('checkpoint_48.tar', map_location='cuda') #记得手动改写
     teacher_model.load_state_dict(checkpoint['model_state_dict'])
     teacher_model.eval()
+    '''
     for param in teacher_model.parameters():
         param.requires_grad = False
     return teacher_model
@@ -189,7 +190,6 @@ def train_one_epoch(net,MODEL,criterion,optimizer,bnm_scheduler,TRAIN_DATALOADER
         for key in batch_data_label:
             batch_data_label[key] = batch_data_label[key].to(device)
         
-        
         # Forward pass
         optimizer.zero_grad()
         inputs = {'point_clouds': batch_data_label['point_clouds']}
@@ -205,9 +205,9 @@ def train_one_epoch(net,MODEL,criterion,optimizer,bnm_scheduler,TRAIN_DATALOADER
                            'full_img_width': batch_data_label['full_img_width'],
                            })
         # 仅第一个batch计算教师输出
-        if batch_idx == 0 and teacher_model is not None:
-            with torch.no_grad():
-                teacher_end_points = teacher_model(inputs)
+        #if batch_idx == 0 and teacher_model is not None:
+        with torch.no_grad():
+            teacher_end_points = teacher_model(inputs)
         
         student_end_points = net(inputs)
         
@@ -216,7 +216,9 @@ def train_one_epoch(net,MODEL,criterion,optimizer,bnm_scheduler,TRAIN_DATALOADER
             if key not in student_end_points:
                 student_end_points[key] = batch_data_label[key]
         print("Student logits :", student_end_points['pc_img_sem_cls_scores'].shape)
+        print("Student len:",len(student_end_points))
         original_loss, student_end_points = criterion(student_end_points, DATASET_CONFIG, KEY_PREFIX_LIST, TOWER_WEIGHTS)   #尚未更改
+        print("Student len:",len(student_end_points))
         print("Student logits :", student_end_points['pc_img_sem_cls_scores'].shape)
         # ======= 插入蒸馏损失计算 START ======= 
         distill_loss = 0
@@ -226,14 +228,18 @@ def train_one_epoch(net,MODEL,criterion,optimizer,bnm_scheduler,TRAIN_DATALOADER
             for key in batch_data_label:
                 if key not in teacher_end_points:
                     teacher_end_points[key] = batch_data_label[key]
-            print("Teacher logits :", student_end_points['pc_img_sem_cls_scores'].shape)
-            teacher_loss, teacher_end_points = criterion(student_end_points, DATASET_CONFIG, KEY_PREFIX_LIST, TOWER_WEIGHTS)   #尚未更改
-            print("Teacher logits :", student_end_points['pc_img_sem_cls_scores'].shape)
+            print("Teacher logits :", teacher_end_points['pc_img_sem_cls_scores'].shape)
+            print("Teacher len:",len(teacher_end_points))
+            teacher_loss, teacher_end_points = criterion(teacher_end_points, DATASET_CONFIG, KEY_PREFIX_LIST, TOWER_WEIGHTS)   #尚未更改
+            print("Teacher len:",len(teacher_end_points))
+            print("Teacher logits :", teacher_end_points['pc_img_sem_cls_scores'].shape)
+        
         distill_loss = F.kl_div(
             F.log_softmax(student_end_points['pc_img_sem_cls_scores'], dim=-1),
             F.softmax(teacher_end_points['pc_img_sem_cls_scores'], dim=-1),
             reduction='batchmean'
-        )#公式导师可以再改改
+        )#公式倒时可以再改改
+        
         #每一次训练学生模型会变，教师模型不变，所以不能把distill_loss放入只有首次的if支线中
         stat_dict['distill_loss'] = distill_loss.item()
         
@@ -542,7 +548,14 @@ def main_dist(local_rank, FLAGS):
             'pc_img_pnet.conv3.weight', 'pc_img_pnet.conv3.bias',
             'image_mlp.img_feat_conv1.weight','image_mlp.img_feat_conv1.bias'
         ]
-
+        # ===== 新增代码开始 =====
+        teacher_checkpoint = torch.load('checkpoint_99.tar', map_location=torch.device("cpu")) #这里我也没在cfg中更改,直接在文件中实现了#有点弄混是用哪个checkpoint了
+        teacher_old_state_dict = teacher_checkpoint['model_state_dict']
+        #keys_to_skip不变
+        teacher_new_state_dict = {k: v for k, v in teacher_old_state_dict.items() if k not in keys_to_skip}
+        teacher_model.load_state_dict(teacher_new_state_dict, strict=False)
+        log_string("-> loaded finetune teacher checkpoint ")
+        # ===== 新增代码结束 =====
         new_state_dict = {k: v for k, v in old_state_dict.items() if k not in keys_to_skip}
         net_no_ddp.load_state_dict(new_state_dict, strict=False)
 
