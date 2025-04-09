@@ -145,21 +145,6 @@ class ImVoteNet(nn.Module):
 
 
 
-        # 添加特征适配层
-        # if use_distillation:
-        #     self.feature_adapters = nn.ModuleDict({
-        #         'backbone': nn.Sequential(
-        #             nn.Conv1d(256, 512, 1),
-        #             nn.BatchNorm1d(512),
-        #             nn.ReLU()
-        #         ),
-        #         'vote': nn.Sequential(
-        #             nn.Conv1d(256 + image_hidden_dim, 512, 1),
-        #             nn.BatchNorm1d(512),
-        #             nn.ReLU()
-        #         )
-        #     })
-
     def batch_encode_text(self, text):
         batch_size = 20
 
@@ -275,36 +260,16 @@ class ImVoteNet(nn.Module):
 
         end_points = self.pc_img_pnet(vote_xyz, vote_features, end_points)
 
-        # 6. 如果需要返回特征
-        # if return_features:
-        #     feature_dict = {
-        #         'backbone_features': backbone_features,
-        #         'vote_features': vote_features,
-        #     }
-        #
-        #     # -------- 3D伪标签生成部分 --------
-        #     B, C, N = vote_features.shape  # vote_features: [B, C, N]
-        #     text_feats = self.text_feats_2Dsemantic  # [num_classes, C]
-        #     text_feats = F.normalize(text_feats, dim=1)  # 单位向量
-        #     vote_features_flat = vote_features.permute(0, 2, 1).reshape(-1, C)  # [B*N, C]
-        #     vote_features_flat = F.normalize(vote_features_flat, dim=1)  # 单位向量
-        #
-        #     # 计算点积相似度 [B*N, num_classes]
-        #     sim_logits = torch.matmul(vote_features_flat, text_feats.T)  # [B*N, num_classes]
-        #     sim_logits = sim_logits.view(B, N, -1)  # [B, N, num_classes]
-        #
-        #     pseudo_labels = sim_logits.argmax(dim=-1)  # [B, N]
-        #
-        #     feature_dict['pseudo_labels'] = pseudo_labels
-        #     feature_dict['similarity_logits'] = sim_logits
-        #
-        #     return end_points, feature_dict
-
         if return_features:
             feature_dict = {
                 'backbone_features': backbone_features,
                 'vote_features': vote_features,
             }
+
+            # 添加各层的 R^a 关系特征
+            relation_keys = ['sa1_relation', 'sa2_relation', 'sa3_relation', 'sa4_relation', 'fp1_relation','fp2_relation']
+            for k in relation_keys:
+                feature_dict[k] = end_points[k]  # 直接传递 R^a 张量
 
             # -------- 3D伪标签生成部分 --------
             B, C, N = vote_features.shape  # vote_features: [B, C, N]
@@ -315,7 +280,6 @@ class ImVoteNet(nn.Module):
 
             # 计算点积相似度 [B*N, num_classes]
             sim_logits = torch.matmul(vote_features_flat, text_feats.float().T)
-  # [B*N, num_classes]
             sim_logits = sim_logits.view(B, N, -1)  # [B, N, num_classes]
 
             # similarity-based 伪标签（方案A）
@@ -324,25 +288,47 @@ class ImVoteNet(nn.Module):
             # 默认设为 sim-based
             final_pseudo_labels = pseudo_labels_sim
 
-            # # 融合方案（可选：添加 EMA 提供的标签）
-            # if hasattr(self, 'ema_pseudo_source') and self.ema_pseudo_source is not None:
-            #     with torch.no_grad():
-            #         ema_endpoints, ema_features = self.ema_pseudo_source(inputs, return_features=True)
-            #         pseudo_labels_ema = ema_features['pseudo_labels']  # [B, N]
-            #         similarity_logits_ema = ema_features['similarity_logits']  # [B, N, num_classes]
-            #
-            #         # 简单融合策略（你可以根据实际修改）：
-            #         sim_confidence = F.softmax(sim_logits, dim=-1).max(dim=-1).values  # [B, N]
-            #         ema_confidence = F.softmax(similarity_logits_ema, dim=-1).max(dim=-1).values  # [B, N]
-            #
-            #         # 比较置信度，选择高置信度来源的标签
-            #         mask_use_ema = ema_confidence > sim_confidence  # [B, N]
-            #         final_pseudo_labels = pseudo_labels_sim.clone()
-            #         final_pseudo_labels[mask_use_ema] = pseudo_labels_ema[mask_use_ema]
-
             feature_dict['pseudo_labels'] = final_pseudo_labels
             feature_dict['similarity_logits'] = sim_logits
 
             return end_points, feature_dict
 
         return end_points
+
+
+# 返回的 feature_dict 结构说明：
+#
+# Key                    Shape / 类型       说明
+# ----------------------------------------------------------------------------
+# backbone_features       (B, 256, N)        上采样后的 backbone 特征
+#                                             B: batch size, 256: 特征维度, N: 点云中投票的数量
+#
+# vote_features           (B, C, N)          投票后的联合特征
+#                                             C: 特征维度, N: 点云中投票的数量
+#
+# sa1_relation            (B, N1, 3+C)       第1层关系特征
+#                                             B: batch size, N1: 第1层特征点数量,
+#                                             3: 相对空间位置 (x, y, z)，C: 特征维度
+#
+# sa2_relation            (B, N2, 3+C)       第2层关系特征
+#                                             B: batch size, N2: 第2层特征点数量,
+#                                             3: 相对空间位置 (x, y, z)，C: 特征维度
+#
+# sa3_relation            (B, N3, 3+C)       第3层关系特征
+#                                             B: batch size, N3: 第3层特征点数量,
+#                                             3: 相对空间位置 (x, y, z)，C: 特征维度
+#
+# sa4_relation            (B, N4, 3+C)       第4层关系特征
+#                                             B: batch size, N4: 第4层特征点数量,
+#                                             3: 相对空间位置 (x, y, z)，C: 特征维度
+#
+# fp2_relation            (B, N, 3+C)        上采样层后的关系特征
+#                                             B: batch size, N: 上采样后的特征点数量,
+#                                             3: 相对空间位置 (x, y, z)，C: 特征维度
+#
+# pseudo_labels           (B, N)             每个 vote 的伪标签
+#                                             B: batch size, N: 点云中投票的数量
+#
+# similarity_logits       (B, N, num_classes) vote 与文本类别的相似度
+#                                             B: batch size, N: 点云中投票的数量,
+#                                             num_classes: 类别数，表示每个投票与各个类别之间的相似度
