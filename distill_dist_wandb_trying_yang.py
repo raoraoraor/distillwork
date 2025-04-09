@@ -16,6 +16,7 @@ from utils.dist import init_distributed, is_distributed, is_primary, get_rank, b
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
 import wandb
+from tqdm import tqdm
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
@@ -27,12 +28,7 @@ from ap_helper import APCalculator, parse_predictions, parse_groundtruths
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-
 import torch.nn.functional as F  # 引用包报错添加
-from tqdm import tqdm
-
-
-
 
 # GLOBAL CONFIG
 BATCH_SIZE = FLAGS.batch_size
@@ -68,7 +64,6 @@ TEACHER_TOWER_WEIGHTS = {
     'pc_only_weight': teacher_weights[1],
     'pc_img_weight': teacher_weights[2]
 }
-
 
 if FLAGS.use_imvotenet:
     KEY_PREFIX_LIST = ['img_only_', 'pc_only_', 'pc_img_']
@@ -184,6 +179,32 @@ def load_teacher_model(MODEL, TRAIN_DATASET, FLAGS, DATASET_CONFIG, num_input_ch
         param.requires_grad = False
     return teacher_model
 
+def custom_pseudo_label_loss(vote_feats, fused_text_feats, tau=0.07):
+    """
+    vote_feats: [B, C, N] - 每个样本 N 个 vote 的 3D 特征
+    fused_text_feats: [B, N] - 每个样本的伪标签 text 特征（不是 C 维度）
+    """
+    B, C, N = vote_feats.shape  # [B, C, N]
+
+    # L2 normalize vote features and text features
+
+    vote_feats = F.normalize(vote_feats, dim=1)  # [B, C, N]
+    text_feats = F.normalize(fused_text_feats.float(), dim=1)  # [B, N]
+
+    # 把 text_feats reshape 成 [B, 1, N]，方便和 vote_feats 对齐计算
+    text_feats = text_feats.unsqueeze(1)  # [B, 1, N]
+
+    # 计算每个 vote 与 text_feat 的点积：[B, C, N] * [B, 1, N] -> [B, N]
+    sim_logits = torch.sum(vote_feats * text_feats, dim=1)  # [B, N]
+
+    # 每个样本中对 vote 做 softmax，分母是所有 vote
+    sim_logits = sim_logits / tau
+    log_probs = sim_logits - torch.logsumexp(sim_logits, dim=1, keepdim=True)  # log softmax
+
+    # 分子是正确的 vote 与 text 的匹配 logit，对角线（正样本）
+    loss = -log_probs.mean()  # 所有样本 N 个 vote 的平均
+    return loss
+
 
 def RelationDistillationLoss(student_features, teacher_features, lambda_relation=1.0):
     """
@@ -211,12 +232,7 @@ def RelationDistillationLoss(student_features, teacher_features, lambda_relation
 
 def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATALOADER,
                     student_tower_weights, teacher_tower_weights,
-                    teacher_model=None, ema_model=None, strategy='fused'):
-    # Initialize tqdm for the epoch progress bar
-    # 初始化 tqdm
-    epoch_len = len(TRAIN_DATALOADER)
-    epoch_progress = tqdm(TRAIN_DATALOADER, total=epoch_len, desc=f'Epoch {EPOCH_CNT}/{MAX_EPOCH}', ncols=100)
-
+                    teacher_model=None, ema_model=None, strategy='fused', epoch=None):
     if is_primary():
         print(">>>>> ema_model received:", type(ema_model))
         if ema_model is not None:
@@ -225,10 +241,15 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
     stat_dict = {}
     net.train()
 
+    # 使用 tqdm 显示进度
+    progress = tqdm(total=len(TRAIN_DATALOADER),
+                    desc=f"Epoch {epoch}" if epoch is not None else "Training",
+                    disable=not is_primary())  # 仅主进程显示
+
     for batch_idx, batch_data_label in enumerate(TRAIN_DATALOADER):
         # ------- 将 batch 数据移到 GPU 上 -------
-        if batch_idx >= 5:  # 🔧 只跑前5个 batch 用于 debug
-            break
+        # if batch_idx >= 5:  # 🔧 只跑前5个 batch 用于 debug
+        #   break
         for key in batch_data_label:
             if isinstance(batch_data_label[key], list):
                 batch_data_label[key] = [item.cuda(non_blocking=True) for item in batch_data_label[key]]
@@ -270,7 +291,7 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
                 # 使用教师模型权重计算 teacher_end_points（用于 soft label 对齐）
                 _ = criterion(teacher_end_points, DATASET_CONFIG, KEY_PREFIX_LIST, teacher_tower_weights)
 
-            # 输出蒸馏损失（分类 KL）
+            # 输出蒸馏损失（分类 KL） 等待增强
             distill_loss = F.kl_div(
                 F.log_softmax(student_end_points['pc_img_sem_cls_scores'], dim=-1),
                 F.softmax(teacher_end_points['pc_img_sem_cls_scores'], dim=-1),
@@ -295,18 +316,23 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
 
             vote_feats = student_features['vote_features']  # [B, C, N]
             B, C, N = vote_feats.shape
-            vote_feats = vote_feats.permute(0, 2, 1).reshape(-1, C)
-            vote_feats = F.normalize(vote_feats, dim=1)
+            # 将 vote_feats 变成 [B, C * N]
+            # vote_feats = vote_feats.permute(0, 2, 1).reshape(B, -1)  # [B, C * N]
+            # vote_feats = F.normalize(vote_feats, dim=1)
 
-            # 获取文本特征向量
-            text_feats = F.normalize((net.module if isinstance(net, DDP) else net).text_feats_2Dsemantic, dim=1)
-            text_feats = text_feats.float()
-            logits = torch.matmul(vote_feats, text_feats.T).view(B, N, -1)
+            # # 获取文本特征向量
+            # text_feats = F.normalize((net.module if isinstance(net, DDP) else net).text_feats_2Dsemantic, dim=1)
+            # text_feats = text_feats.float()
+            # logits = torch.matmul(vote_feats, text_feats.T).view(B, N, -1)
 
             # 获取伪标签
-            pseudo_labels_sim = student_features['pseudo_labels']
-            pseudo_labels_ema = ema_features['pseudo_labels']
-            similarity_logits_ema = ema_features['similarity_logits']
+            pseudo_labels_sim = student_features['sim_pseudo_labels']  # sim的伪标签
+            # pseudo_labels_ema = student_features['ema_pseudo_labels']  # EMA 模型的伪标签
+            similarity_logits = student_features['similarity_logits']
+            # print("similarity_logits", similarity_logits.shape)
+            # ema_similarity_logits = student_features['ema_similarity_logits']  # EMA 模型的相似度 logits
+
+            fused_pseudo_labels=None
 
             # 选择伪标签融合策略
             if strategy == 'sim':
@@ -314,15 +340,17 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
             elif strategy == 'ema':
                 fused_pseudo_labels = pseudo_labels_ema
             elif strategy == 'fused':
-                sim_conf = F.softmax(logits, dim=-1).max(dim=-1).values
-                ema_conf = F.softmax(similarity_logits_ema, dim=-1).max(dim=-1).values
-                fused_pseudo_labels = pseudo_labels_sim.clone()
-                mask_use_ema = ema_conf > sim_conf
-                fused_pseudo_labels[mask_use_ema] = pseudo_labels_ema[mask_use_ema]
+                fused_pseudo_labels = pseudo_labels_sim
+                # sim_conf = F.softmax(logits, dim=-1).max(dim=-1).values
+                # ema_conf = F.softmax(similarity_logits_ema, dim=-1).max(dim=-1).values
+                # fused_pseudo_labels = pseudo_labels_sim.clone()
+                # if ema_conf > sim_conf:
+                #     fused_pseudo_labels = pseudo_labels_ema
 
             # 计算伪标签蒸馏损失
-            pseudo_label_loss = F.cross_entropy(logits.permute(0, 2, 1), fused_pseudo_labels)
+            # pseudo_label_loss = F.cross_entropy(vote_feats, fused_pseudo_labels)
 
+            pseudo_label_loss = custom_pseudo_label_loss(vote_feats, fused_pseudo_labels)
 
         # ======= 关系特征蒸馏损失计算 =======
         relation_distill_loss = torch.tensor(0.0).cuda()
@@ -372,20 +400,19 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
             if ema_model:
                 log_str += f'| pseudo_label_loss: {pseudo_label_loss.item():.4f} '
             log_str += f'| relation_distill_loss: {relation_distill_loss.item():.4f}'
-
-            # ✅ 用 tqdm.write 替代 log_string，避免破坏进度条
+            # ✅ 用 tqdm.write 替代 log_string，避免破坏进度条 (ok的)
             tqdm.write(log_str)
-
-
-        # tqdm 简洁更新（只显示当前 batch 的总 loss）
-        epoch_progress.set_description(f"Epoch {EPOCH_CNT}:")
-        epoch_progress.set_postfix(batch=batch_idx + 1, loss=total_loss.item())
 
         # ------- 更新 EMA 模型 -------
         if ema_model is not None:
             update_ema_model(student_model=net.module if isinstance(net, DDP) else net,
                              ema_model=ema_model,
                              alpha=0.999)
+        # 更新进度条
+        progress.update(1)
+        progress.set_postfix({"loss": total_loss.item()})
+
+    progress.close()
 
     # Save checkpoint logic here:
     barrier()
@@ -413,8 +440,8 @@ def evaluate_one_epoch(net, MODEL, criterion, optimizer, TRAIN_DATALOADER, TEST_
         net.eval()  # set model to eval mode (for bn and dp)
         barrier()
         for batch_idx, batch_data_label in enumerate(DATASET_ITEM):
-            if batch_idx >= 5:
-                break
+            # if batch_idx >= 5:
+            #   break
             if batch_idx % 10 == 0:
                 print('Eval batch: %d' % (batch_idx))
             for key in batch_data_label:
@@ -483,6 +510,7 @@ def train_or_evaluate(start_epoch, net, MODEL, net_no_ddp, criterion, optimizer,
     global EPOCH_CNT
     loss = 0
     max_mAP = [0.0]  # Initialize max_mAP to a small value
+    mAP_LIST = []  # 初始化 mAP_LIST以防止其报错
 
     # ----------- 新增：解析 tower 权重 -----------
     student_weights = [float(x) for x in FLAGS.student_tower_weights.split(',')]
@@ -518,15 +546,22 @@ def train_or_evaluate(start_epoch, net, MODEL, net_no_ddp, criterion, optimizer,
             student_tower_weights, teacher_tower_weights,
             teacher_model=teacher_model,
             ema_model=ema_model,
-            strategy=strategy
+            strategy=strategy,
+            epoch=epoch
         )
-
+        #
+        #
+        #
+        #
+        #    ATTENTION!!!!!! 下面这一个部分是否需要改动我还需要验证（2025/4/9下午17：20）
+        #
+        #
+        #
         if is_primary() and FLAGS.if_wandb:
             for key_prefix in KEY_PREFIX_LIST:
                 if key_prefix in stat_dict_loss:
                     average = sum(stat_dict_loss[key_prefix]) / len(stat_dict_loss[key_prefix])
                     wandb.log({f"train/{key_prefix}_loss": average}, step=epoch)
-
 
         # Save checkpoint
         save_dict = {
@@ -539,7 +574,8 @@ def train_or_evaluate(start_epoch, net, MODEL, net_no_ddp, criterion, optimizer,
         except:
             save_dict['model_state_dict'] = net.state_dict()
 
-        loss,mAP_LIST = evaluate_one_epoch(net,MODEL,criterion,optimizer,TRAIN_DATALOADER,TEST_DATALOADER,epoch)
+        # 更改了eval的顺序，先检查ckpt是否能够保存，然后再检查是否能够成功完成对应的验证
+        loss, mAP_LIST = evaluate_one_epoch(net, MODEL, criterion, optimizer, TRAIN_DATALOADER, TEST_DATALOADER, epoch)
 
         if is_primary():
             torch.save(save_dict, os.path.join(LOG_DIR, f'checkpoint.tar'))
@@ -559,10 +595,10 @@ def train_or_evaluate(start_epoch, net, MODEL, net_no_ddp, criterion, optimizer,
                     torch.save(save_dict, os.path.join(LOG_DIR, f'checkpoint_best_mAP_dataset_in_{FLAGS.dataset}.tar'))
 
 
-
 # Init datasets and dataloaders
 def my_worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
+
 
 def setup_student_network(local_rank, FLAGS, DATASET_CONFIG, TRAIN_DATASET):
     # 获取学生网络的tower_weights
@@ -630,7 +666,6 @@ def setup_ema_model(net_no_ddp):
     return ema_model
 
 
-
 def main_dist(local_rank, FLAGS):
     start_epoch = 0
     init_distributed(
@@ -670,8 +705,8 @@ def main_dist(local_rank, FLAGS):
     net = setup_student_network(local_rank, FLAGS, DATASET_CONFIG, TRAIN_DATASET)
 
     # 设置教师模型（如果是主节点）
-    teacher_model = setup_teacher_network(importlib.import_module('imvotenet'), TRAIN_DATASET, FLAGS, DATASET_CONFIG, int(FLAGS.use_color) * 3 + int(not FLAGS.no_height) * 1)
-
+    teacher_model = setup_teacher_network(importlib.import_module('imvotenet'), TRAIN_DATASET, FLAGS, DATASET_CONFIG,
+                                          int(FLAGS.use_color) * 3 + int(not FLAGS.no_height) * 1)
 
     # 设置EMA模型
     ema_model = setup_ema_model(net)
@@ -712,12 +747,36 @@ def main_dist(local_rank, FLAGS):
         log_string(f"-> loaded checkpoint {CHECKPOINT_PATH} (epoch: {start_epoch})")
         torch.cuda.empty_cache()
 
+    if FLAGS.finetune and CHECKPOINT_PATH is not None and os.path.isfile(CHECKPOINT_PATH):
+        print("finetune!!!")
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=torch.device("cpu"))
+        old_state_dict = checkpoint['model_state_dict']
+        keys_to_skip = [
+            'img_only_pnet.conv3.weight', 'img_only_pnet.conv3.bias',
+            'pc_only_pnet.conv3.weight', 'pc_only_pnet.conv3.bias',
+            'pc_img_pnet.conv3.weight', 'pc_img_pnet.conv3.bias',
+            'image_mlp.img_feat_conv1.weight', 'image_mlp.img_feat_conv1.bias'
+        ]
+        # ===== 新增代码开始 =====
+        teacher_checkpoint = torch.load('/root/autodl-tmp/ImOV3D/CHECKPOINT/checkpoint_48.tar',
+                                        map_location=torch.device("cpu"))  # 这里我也没在cfg中更改,直接在文件中实现了#有点弄混是用哪个checkpoint了
+        teacher_old_state_dict = teacher_checkpoint['model_state_dict']
+        # keys_to_skip不变
+        teacher_new_state_dict = {k: v for k, v in teacher_old_state_dict.items() if k not in keys_to_skip}
+        teacher_model.load_state_dict(teacher_new_state_dict, strict=False)
+        log_string("-> loaded finetune teacher checkpoint ")
+        # ===== 新增代码结束 =====
+        new_state_dict = {k: v for k, v in old_state_dict.items() if k not in keys_to_skip}
+        net.load_state_dict(new_state_dict, strict=False)
+
+        log_string("-> loaded finetune checkpoint %s" % (CHECKPOINT_PATH))
+        torch.cuda.empty_cache()
+
     # 初始化BatchNorm Momentum调度器
     BN_MOMENTUM_INIT = 0.5
     BN_MOMENTUM_MAX = 0.001
     bn_lbmd = lambda it: max(BN_MOMENTUM_INIT * BN_DECAY_RATE ** (int(it / BN_DECAY_STEP)), BN_MOMENTUM_MAX)
     bnm_scheduler = BNMomentumScheduler(net, bn_lambda=bn_lbmd, last_epoch=start_epoch - 1)
-
 
     if hasattr(FLAGS, 'student_tower_weights'):
         print(f"📚 [学生模型] tower_weights: {FLAGS.student_tower_weights}")
