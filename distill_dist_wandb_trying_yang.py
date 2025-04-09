@@ -233,11 +233,6 @@ def RelationDistillationLoss(student_features, teacher_features, lambda_relation
 def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATALOADER,
                     student_tower_weights, teacher_tower_weights,
                     teacher_model=None, ema_model=None, strategy='fused', epoch=None):
-    if is_primary():
-        print(">>>>> ema_model received:", type(ema_model))
-        if ema_model is not None:
-            print(">>>>> ema_model device:", next(ema_model.parameters()).device)
-
     stat_dict = {}
     net.train()
 
@@ -310,50 +305,54 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
             ).mean()
 
         # ------- EMA伪标签蒸馏 -------
-        if ema_model is not None:
-            with torch.no_grad():
-                _, ema_features = ema_model(inputs, return_features=True)
 
-            vote_feats = student_features['vote_features']  # [B, C, N]
-            B, C, N = vote_feats.shape
-            # 将 vote_feats 变成 [B, C * N]
-            # vote_feats = vote_feats.permute(0, 2, 1).reshape(B, -1)  # [B, C * N]
-            # vote_feats = F.normalize(vote_feats, dim=1)
+        vote_feats = student_features['vote_features']  # [B, C, N]
+        B, C, N = vote_feats.shape
+        # 将 vote_feats 变成 [B, C * N]
+        # vote_feats = vote_feats.permute(0, 2, 1).reshape(B, -1)  # [B, C * N]
+        # vote_feats = F.normalize(vote_feats, dim=1)
 
-            # # 获取文本特征向量
-            # text_feats = F.normalize((net.module if isinstance(net, DDP) else net).text_feats_2Dsemantic, dim=1)
-            # text_feats = text_feats.float()
-            # logits = torch.matmul(vote_feats, text_feats.T).view(B, N, -1)
+        # # 获取文本特征向量
+        # text_feats = F.normalize((net.module if isinstance(net, DDP) else net).text_feats_2Dsemantic, dim=1)
+        # text_feats = text_feats.float()
+        # logits = torch.matmul(vote_feats, text_feats.T).view(B, N, -1)
 
-            # 获取伪标签
-            pseudo_labels_sim = student_features['sim_pseudo_labels']  # sim的伪标签
-            # pseudo_labels_ema = student_features['ema_pseudo_labels']  # EMA 模型的伪标签
-            similarity_logits = student_features['similarity_logits']
-            # print("similarity_logits", similarity_logits.shape)
-            # ema_similarity_logits = student_features['ema_similarity_logits']  # EMA 模型的相似度 logits
+        # 获取伪标签
+        pseudo_labels_sim = student_features['sim_pseudo_labels']  # sim的伪标签
+        pseudo_labels_ema = student_features['ema_pseudo_labels']  # EMA 模型的伪标签
+        similarity_logits = student_features['similarity_logits']
+        # print("similarity_logits", similarity_logits.shape)
+        ema_similarity_logits = student_features['ema_similarity_logits']  # EMA 模型的相似度 logits
 
-            fused_pseudo_labels=None
+        fused_pseudo_labels=None
 
-            # 选择伪标签融合策略
-            if strategy == 'sim':
-                fused_pseudo_labels = pseudo_labels_sim
-            elif strategy == 'ema':
+        # 选择伪标签融合策略
+        if strategy == 'sim':
+            fused_pseudo_labels = pseudo_labels_sim
+        elif strategy == 'ema':
+            fused_pseudo_labels = pseudo_labels_ema
+        elif strategy == 'fused':
+            fused_pseudo_labels = pseudo_labels_sim
+            sim_conf = F.softmax(similarity_logits, dim=-1).max(dim=-1).values
+            ema_conf = F.softmax(ema_similarity_logits, dim=-1).max(dim=-1).values
+            fused_pseudo_labels = pseudo_labels_sim.clone()
+            if ema_conf.max() > sim_conf.max():
                 fused_pseudo_labels = pseudo_labels_ema
-            elif strategy == 'fused':
-                fused_pseudo_labels = pseudo_labels_sim
-                # sim_conf = F.softmax(logits, dim=-1).max(dim=-1).values
-                # ema_conf = F.softmax(similarity_logits_ema, dim=-1).max(dim=-1).values
-                # fused_pseudo_labels = pseudo_labels_sim.clone()
-                # if ema_conf > sim_conf:
-                #     fused_pseudo_labels = pseudo_labels_ema
 
-            # 计算伪标签蒸馏损失
-            # pseudo_label_loss = F.cross_entropy(vote_feats, fused_pseudo_labels)
 
-            pseudo_label_loss = custom_pseudo_label_loss(vote_feats, fused_pseudo_labels)
+        # 计算伪标签蒸馏损失
+        # pseudo_label_loss = F.cross_entropy(vote_feats, fused_pseudo_labels)
+
+        pseudo_label_loss = custom_pseudo_label_loss(vote_feats, fused_pseudo_labels)
+        # 直接转化为数值（float），不再是张量
+        pseudo_label_loss = pseudo_label_loss.item() if pseudo_label_loss is not None else 0.0
+        # print("pseudo_label_loss", pseudo_label_loss)
+
+
 
         # ======= 关系特征蒸馏损失计算 =======
         relation_distill_loss = torch.tensor(0.0).cuda()
+
         if teacher_model is not None:
             # 计算教师模型和学生模型的关系特征蒸馏损失
             relation_distill_loss = RelationDistillationLoss(student_features, teacher_features)
@@ -378,36 +377,19 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
         if teacher_model:
             stat_dict['distill_loss'] = stat_dict.get('distill_loss', 0.0) + distill_loss.item()
             stat_dict['feat_distill_loss'] = stat_dict.get('feat_distill_loss', 0.0) + feat_distill_loss.item()
-        if ema_model:
-            stat_dict['pseudo_label_loss'] = stat_dict.get('pseudo_label_loss', 0.0) + pseudo_label_loss.item()
-        stat_dict['relation_distill_loss'] = stat_dict.get('relation_distill_loss',
-                                                           0.0) + relation_distill_loss.item()
+            stat_dict['pseudo_label_loss'] = stat_dict.get('pseudo_label_loss', 0.0) + pseudo_label_loss
+            stat_dict['relation_distill_loss'] = stat_dict.get('relation_distill_loss',
+                                                               0.0) + relation_distill_loss.item()
 
-        # # ------- 控制台打印 -------
-        # if is_primary() and (batch_idx + 1) % 1 == 0:
-        #     log_str = f'[Batch {batch_idx + 1:03d}] total_loss: {total_loss.item():.4f}, original: {original_loss.item():.4f} '
-        #     if teacher_model:
-        #         log_str += f'| out_distill: {distill_loss.item():.4f}, feat_distill: {feat_distill_loss.item():.4f} '
-        #     if ema_model:
-        #         log_str += f'| pseudo_label_loss: {pseudo_label_loss.item():.4f} '
-        #     log_str += f'| relation_distill_loss: {relation_distill_loss.item():.4f}'
-        #     log_string(log_str)
-        # ------- 控制台打印 -------
         if is_primary() and (batch_idx + 1) % 1 == 0:
             log_str = f'[Batch {batch_idx + 1:03d}] total_loss: {total_loss.item():.4f}, original: {original_loss.item():.4f} '
             if teacher_model:
                 log_str += f'| out_distill: {distill_loss.item():.4f}, feat_distill: {feat_distill_loss.item():.4f} '
-            if ema_model:
-                log_str += f'| pseudo_label_loss: {pseudo_label_loss.item():.4f} '
+                log_str += f'| pseudo_label_loss: {pseudo_label_loss:.4f} '
             log_str += f'| relation_distill_loss: {relation_distill_loss.item():.4f}'
             # ✅ 用 tqdm.write 替代 log_string，避免破坏进度条 (ok的)
             tqdm.write(log_str)
 
-        # ------- 更新 EMA 模型 -------
-        if ema_model is not None:
-            update_ema_model(student_model=net.module if isinstance(net, DDP) else net,
-                             ema_model=ema_model,
-                             alpha=0.999)
         # 更新进度条
         progress.update(1)
         progress.set_postfix({"loss": total_loss.item()})
@@ -549,14 +531,7 @@ def train_or_evaluate(start_epoch, net, MODEL, net_no_ddp, criterion, optimizer,
             strategy=strategy,
             epoch=epoch
         )
-        #
-        #
-        #
-        #
-        #    ATTENTION!!!!!! 下面这一个部分是否需要改动我还需要验证（2025/4/9下午17：20）
-        #
-        #
-        #
+
         if is_primary() and FLAGS.if_wandb:
             for key_prefix in KEY_PREFIX_LIST:
                 if key_prefix in stat_dict_loss:
@@ -647,15 +622,15 @@ def setup_student_network(local_rank, FLAGS, DATASET_CONFIG, TRAIN_DATASET):
 
 
 def setup_teacher_network(MODEL, TRAIN_DATASET, FLAGS, DATASET_CONFIG, num_input_channel):
-    # 获取教师网络的tower_weights
     teacher_tower_weights = list(map(float, FLAGS.teacher_tower_weights.split(',')))
 
-    # 初始化教师模型（如果是主节点）
-    teacher_model = None
-    if is_primary():
-        teacher_model = load_teacher_model(MODEL, TRAIN_DATASET, FLAGS, DATASET_CONFIG, num_input_channel)
-        # 将教师的tower_weights传递给模型
-        teacher_model.set_tower_weights(teacher_tower_weights)
+    # 所有进程都加载教师模型
+    teacher_model = load_teacher_model(MODEL, TRAIN_DATASET, FLAGS, DATASET_CONFIG, num_input_channel)
+    teacher_model.set_tower_weights(teacher_tower_weights)
+
+    # teacher_model.eval()
+    # for p in teacher_model.parameters():
+    #     p.requires_grad = False
 
     return teacher_model
 
@@ -704,12 +679,12 @@ def main_dist(local_rank, FLAGS):
     # 设置学生网络（正在训练的网络）
     net = setup_student_network(local_rank, FLAGS, DATASET_CONFIG, TRAIN_DATASET)
 
+
     # 设置教师模型（如果是主节点）
     teacher_model = setup_teacher_network(importlib.import_module('imvotenet'), TRAIN_DATASET, FLAGS, DATASET_CONFIG,
                                           int(FLAGS.use_color) * 3 + int(not FLAGS.no_height) * 1)
 
-    # 设置EMA模型
-    ema_model = setup_ema_model(net)
+
 
     # 如果是分布式训练，使用DistributedDataParallel
     if is_distributed():
@@ -718,9 +693,16 @@ def main_dist(local_rank, FLAGS):
 
         # 同步教师和EMA模型的BN（尽管他们不训练，但一些任务可能需要）
         if teacher_model is not None:
-            teacher_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(teacher_model)
-        if ema_model is not None:
-            ema_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ema_model)
+            teacher_model = teacher_model.cuda()  # 搬上 GPU 即可
+
+            # 只有在有梯度参数时才使用 DDP
+            if any(p.requires_grad for p in teacher_model.parameters()):
+                teacher_model = torch.nn.parallel.DistributedDataParallel(
+                    teacher_model,
+                    device_ids=[local_rank],
+                    find_unused_parameters=True
+                )
+
 
     # 损失函数
     criterion = importlib.import_module('imvotenet').get_loss
@@ -796,7 +778,7 @@ def main_dist(local_rank, FLAGS):
         train_sampler,
         TRAIN_DATALOADER,
         TEST_DATALOADER,
-        ema_model=ema_model,
+        ema_model=None,
         teacher_model=teacher_model,
         strategy='fused',  # 'fused' 结合教师模型和EMA蒸馏
         FLAGS=FLAGS  # 传递 FLAGS 参数
