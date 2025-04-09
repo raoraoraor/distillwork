@@ -29,6 +29,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 import torch.nn.functional as F  # 引用包报错添加
+from tqdm import tqdm
 
 
 
@@ -184,33 +185,38 @@ def load_teacher_model(MODEL, TRAIN_DATASET, FLAGS, DATASET_CONFIG, num_input_ch
     return teacher_model
 
 
-# 当前维度已对齐，暂未使用
-def compute_distillation_loss(student_end_points, teacher_end_points, dataset_config):
-    print("Student logits :", student_end_points['pc_img_sem_cls_scores'].shape)
-    print("Teacher logits :", teacher_end_points['pc_img_sem_cls_scores'].shape)
+def RelationDistillationLoss(student_features, teacher_features, lambda_relation=1.0):
+    """
+    计算关系特征蒸馏损失 (Relation Distillation Loss).
 
-    # 确保教师和学生logits维度匹配
-    student_logits = student_end_points['pc_img_sem_cls_scores']  # [B,N,23]
+    输入:
+        student_features: 学生模型的特征字典，包含关系特征
+        teacher_features: 教师模型的特征字典，包含关系特征
+        lambda_relation: 控制关系蒸馏损失的权重系数
 
-    # 获取教师logits中对应数据集类别的部分
-    eval_class_ids = torch.tensor(
-        sorted(list(dataset_config.class2type_eval.keys())),
-        device=student_logits.device
-    )
-    teacher_logits = teacher_end_points['pc_img_sem_cls_scores'].index_select(
-        -1, eval_class_ids)  # [B,N,23]
+    输出:
+        relation_loss: 关系特征蒸馏损失
+    """
 
-    # 安全计算KL散度
-    return F.kl_div(
-        F.log_softmax(student_logits, dim=-1),
-        F.softmax(teacher_logits.detach(), dim=-1),
-        reduction='batchmean'
-    )
+    # 从学生和教师模型中提取关系特征
+    student_relation = student_features['fp2_relation']  # 这里选择 'fp2_relation'，可以根据需要修改
+    teacher_relation = teacher_features['fp2_relation']  # 同上，使用教师模型的关系特征
+
+    # 计算关系特征蒸馏损失：采用L2范数（欧式距离）作为蒸馏损失
+    relation_loss = F.mse_loss(student_relation, teacher_relation)
+
+    # 返回损失乘以一个系数
+    return lambda_relation * relation_loss
 
 
 def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATALOADER,
                     student_tower_weights, teacher_tower_weights,
                     teacher_model=None, ema_model=None, strategy='fused'):
+    # Initialize tqdm for the epoch progress bar
+    # 初始化 tqdm
+    epoch_len = len(TRAIN_DATALOADER)
+    epoch_progress = tqdm(TRAIN_DATALOADER, total=epoch_len, desc=f'Epoch {EPOCH_CNT}/{MAX_EPOCH}', ncols=100)
+
     if is_primary():
         print(">>>>> ema_model received:", type(ema_model))
         if ema_model is not None:
@@ -221,6 +227,8 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
 
     for batch_idx, batch_data_label in enumerate(TRAIN_DATALOADER):
         # ------- 将 batch 数据移到 GPU 上 -------
+        if batch_idx >= 5:  # 🔧 只跑前5个 batch 用于 debug
+            break
         for key in batch_data_label:
             if isinstance(batch_data_label[key], list):
                 batch_data_label[key] = [item.cuda(non_blocking=True) for item in batch_data_label[key]]
@@ -315,12 +323,20 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
             # 计算伪标签蒸馏损失
             pseudo_label_loss = F.cross_entropy(logits.permute(0, 2, 1), fused_pseudo_labels)
 
+
+        # ======= 关系特征蒸馏损失计算 =======
+        relation_distill_loss = torch.tensor(0.0).cuda()
+        if teacher_model is not None:
+            # 计算教师模型和学生模型的关系特征蒸馏损失
+            relation_distill_loss = RelationDistillationLoss(student_features, teacher_features)
+
         # ======= 总损失组合 =======
         total_loss = (
                 original_loss +
                 FLAGS.output_distill_weight * distill_loss +
                 FLAGS.feat_distill_weight * feat_distill_loss +
-                FLAGS.pseudo_label_weight * pseudo_label_loss
+                FLAGS.pseudo_label_weight * pseudo_label_loss +
+                FLAGS.relation_distill_weight * relation_distill_loss  # 关系特征蒸馏损失
         )
 
         # 反向传播 + 参数更新
@@ -336,15 +352,34 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
             stat_dict['feat_distill_loss'] = stat_dict.get('feat_distill_loss', 0.0) + feat_distill_loss.item()
         if ema_model:
             stat_dict['pseudo_label_loss'] = stat_dict.get('pseudo_label_loss', 0.0) + pseudo_label_loss.item()
+        stat_dict['relation_distill_loss'] = stat_dict.get('relation_distill_loss',
+                                                           0.0) + relation_distill_loss.item()
 
+        # # ------- 控制台打印 -------
+        # if is_primary() and (batch_idx + 1) % 1 == 0:
+        #     log_str = f'[Batch {batch_idx + 1:03d}] total_loss: {total_loss.item():.4f}, original: {original_loss.item():.4f} '
+        #     if teacher_model:
+        #         log_str += f'| out_distill: {distill_loss.item():.4f}, feat_distill: {feat_distill_loss.item():.4f} '
+        #     if ema_model:
+        #         log_str += f'| pseudo_label_loss: {pseudo_label_loss.item():.4f} '
+        #     log_str += f'| relation_distill_loss: {relation_distill_loss.item():.4f}'
+        #     log_string(log_str)
         # ------- 控制台打印 -------
         if is_primary() and (batch_idx + 1) % 1 == 0:
             log_str = f'[Batch {batch_idx + 1:03d}] total_loss: {total_loss.item():.4f}, original: {original_loss.item():.4f} '
             if teacher_model:
                 log_str += f'| out_distill: {distill_loss.item():.4f}, feat_distill: {feat_distill_loss.item():.4f} '
             if ema_model:
-                log_str += f'| pseudo_label_loss: {pseudo_label_loss.item():.4f}'
-            log_string(log_str)
+                log_str += f'| pseudo_label_loss: {pseudo_label_loss.item():.4f} '
+            log_str += f'| relation_distill_loss: {relation_distill_loss.item():.4f}'
+
+            # ✅ 用 tqdm.write 替代 log_string，避免破坏进度条
+            tqdm.write(log_str)
+
+
+        # tqdm 简洁更新（只显示当前 batch 的总 loss）
+        epoch_progress.set_description(f"Epoch {EPOCH_CNT}:")
+        epoch_progress.set_postfix(batch=batch_idx + 1, loss=total_loss.item())
 
         # ------- 更新 EMA 模型 -------
         if ema_model is not None:
@@ -355,41 +390,7 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
     # Save checkpoint logic here:
     barrier()
 
-    # #__________________________________
-    # # if is_primary():
-    # # Save the model checkpoint
-    # save_dict = {
-    #     'epoch': epoch + 1,  # after training one epoch, the start_epoch should be epoch+1
-    #     'optimizer_state_dict': optimizer.state_dict(),
-    #     'loss': total_loss.item(),
-    # }
-    # try:
-    #     save_dict['model_state_dict'] = net.module.state_dict()
-    # except:
-    #     save_dict['model_state_dict'] = net.state_dict()
-    #
-    # print(LOG_DIR)
-    # print(save_dict, os.path.join(LOG_DIR, f'checkpoint.tar'))
-    #
-    # torch.save(save_dict, os.path.join(FLAGS.log_dir, f'checkpoint.tar'))
-    #
-    # if EPOCH_CNT == 0 or EPOCH_CNT % 10 == 9:  # Eval every 10 epochs
-    #     if not os.path.exists(LOG_DIR):
-    #         os.makedirs(LOG_DIR)
-    #     save_path = os.path.join(LOG_DIR, f'checkpoint_{EPOCH_CNT}.tar')
-    #     print(f"Saving checkpoint to: {save_path}")
-    #     torch.save(save_dict, save_path)
-    #
-    # for i, mAP in enumerate(mAP_LIST):
-    #     if mAP > max_mAP[i]:
-    #         max_mAP[i] = mAP
-    #         if not os.path.exists(LOG_DIR):
-    #             os.makedirs(LOG_DIR)
-    #         save_path = os.path.join(LOG_DIR, f'checkpoint_best_mAP_dataset_in_{FLAGS.dataset}.tar')
-    #         print(f"Saving checkpoint to: {save_path}")
-    #         torch.save(save_dict, save_path)
-    #
-    # return stat_dict
+    return stat_dict
 
 
 def evaluate_one_epoch(net, MODEL, criterion, optimizer, TRAIN_DATALOADER, TEST_DATALOADER, epoch):
@@ -412,6 +413,8 @@ def evaluate_one_epoch(net, MODEL, criterion, optimizer, TRAIN_DATALOADER, TEST_
         net.eval()  # set model to eval mode (for bn and dp)
         barrier()
         for batch_idx, batch_data_label in enumerate(DATASET_ITEM):
+            if batch_idx >= 5:
+                break
             if batch_idx % 10 == 0:
                 print('Eval batch: %d' % (batch_idx))
             for key in batch_data_label:
@@ -536,8 +539,8 @@ def train_or_evaluate(start_epoch, net, MODEL, net_no_ddp, criterion, optimizer,
         except:
             save_dict['model_state_dict'] = net.state_dict()
 
-        print(LOG_DIR)
-        print(save_dict, os.path.join(LOG_DIR, f'checkpoint.tar'))
+        loss,mAP_LIST = evaluate_one_epoch(net,MODEL,criterion,optimizer,TRAIN_DATALOADER,TEST_DATALOADER,epoch)
+
         if is_primary():
             torch.save(save_dict, os.path.join(LOG_DIR, f'checkpoint.tar'))
             if EPOCH_CNT == 0 or EPOCH_CNT % 10 == 9:  # Eval every 10 epochs
