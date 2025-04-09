@@ -143,7 +143,23 @@ class ImVoteNet(nn.Module):
         self.feat_distill_weight = feat_distill_weight
         self.use_distillation = use_distillation
 
-
+    # def initialize_ema_model(self):
+    #     """ 使用 deepcopy 初始化 EMA 模型 """
+    #     self.ema_model = copy.deepcopy(self)
+    #     self.ema_model.eval()
+    #     for param in self.ema_model.parameters():
+    #         param.requires_grad = False
+    #
+    # def update_ema_model(self, alpha=None):
+    #     """ EMA 参数更新 """
+    #     if self.ema_model is None:
+    #         return
+    #
+    #     if alpha is None:
+    #         alpha = self.ema_decay
+    #
+    #     for ema_param, param in zip(self.ema_model.parameters(), self.parameters()):
+    #         ema_param.data.mul_(alpha).add_(param.data * (1 - alpha))
 
     def batch_encode_text(self, text):
         batch_size = 20
@@ -261,38 +277,57 @@ class ImVoteNet(nn.Module):
         end_points = self.pc_img_pnet(vote_xyz, vote_features, end_points)
 
         if return_features:
+            # 创建一个字典存储特征信息
             feature_dict = {
-                'backbone_features': backbone_features,
-                'vote_features': vote_features,
+                'backbone_features': end_points['fp2_features'],  # 上采样后的 backbone 特征
+                'vote_features': vote_features,  # 投票后的联合特征
             }
 
             # 添加各层的 R^a 关系特征
-            relation_keys = ['sa1_relation', 'sa2_relation', 'sa3_relation', 'sa4_relation', 'fp1_relation','fp2_relation']
+            relation_keys = ['sa1_relation', 'sa2_relation', 'sa3_relation', 'sa4_relation', 'fp2_relation']
             for k in relation_keys:
                 feature_dict[k] = end_points[k]  # 直接传递 R^a 张量
 
-            # -------- 3D伪标签生成部分 --------
-            B, C, N = vote_features.shape  # vote_features: [B, C, N]
-            text_feats = self.text_feats_2Dsemantic  # [num_classes, C]
-            text_feats = F.normalize(text_feats, dim=1)  # 单位向量
-            vote_features_flat = vote_features.permute(0, 2, 1).reshape(-1, C)  # [B*N, C]
-            vote_features_flat = F.normalize(vote_features_flat, dim=1)  # 单位向量
+            # 计算基于相似度的伪标签
+            B, C, N = vote_features.shape  # 获取 batch size (B), 类别数 (C), 投票点数量 (N)
+            # print("vote_features",vote_features.shape)
+            # 获取文本特征并进行归一化
+            text_feats = self.text_feats_2Dsemantic  # 文本特征（预训练好的 2D 语义特征）
+            text_feats = F.normalize(text_feats, dim=1)  # 按行进行归一化
 
-            # 计算点积相似度 [B*N, num_classes]
-            sim_logits = torch.matmul(vote_features_flat, text_feats.float().T)
-            sim_logits = sim_logits.view(B, N, -1)  # [B, N, num_classes]
 
-            # similarity-based 伪标签（方案A）
-            pseudo_labels_sim = sim_logits.argmax(dim=-1)  # [B, N]
+            # 展平 vote_features，形状为 [B*N, C]，用于后续计算相似度
+            vote_features_flat = vote_features.permute(0, 2, 1).reshape(-1, C)  # 转置并展平
+            vote_features_flat = F.normalize(vote_features_flat, dim=1)  # 对投票特征进行归一化
 
-            # 默认设为 sim-based
-            final_pseudo_labels = pseudo_labels_sim
+            # 计算投票特征与文本特征的相似度（内积计算）
+            sim_logits = torch.matmul(vote_features_flat, text_feats.float().T)  # 计算相似度 logits
+            sim_logits = sim_logits.view(B, N, -1)  # 重塑形状为 [B, N, num_classes]
 
-            feature_dict['pseudo_labels'] = final_pseudo_labels
-            feature_dict['similarity_logits'] = sim_logits
+            # 生成基于相似度的伪标签（取相似度最大的类别索引）
+            pseudo_labels_sim = sim_logits.argmax(dim=-1)  # 通过 argmax 获取最大相似度对应的类别标签
+            feature_dict['similarity_logits'] = sim_logits  # 存储相似度 logits
+            
+            feature_dict['sim_pseudo_labels'] = pseudo_labels_sim  # 存储基于相似度的伪标签
 
-            return end_points, feature_dict
+            # # 生成基于 EMA 模型的伪标签
+            # ema_vote_features = self.ema_model.pc_img_vgen(end_points['seed_xyz'], joint_features)[1]  # 从 EMA 模型生成投票特征
+            # ema_vote_features = F.normalize(ema_vote_features, p=2, dim=1)  # 对 EMA 投票特征进行归一化
+            #
+            # # 展平 EMA 投票特征并进行归一化
+            # ema_vote_features_flat = ema_vote_features.permute(0, 2, 1).reshape(-1, C)  # 转置并展平
+            # ema_vote_features_flat = F.normalize(ema_vote_features_flat, dim=1)  # 对 EMA 投票特征进行归一化
+            #
+            # # 计算 EMA 投票特征与文本特征的相似度（内积计算）
+            # ema_sim_logits = torch.matmul(ema_vote_features_flat, text_feats.float().T)  # 计算 EMA 相似度 logits
+            # ema_sim_logits = ema_sim_logits.view(B, N, -1)  # 重塑形状为 [B, N, num_classes]
+            #
+            # # 生成基于 EMA 的伪标签（取相似度最大的类别索引）
+            # ema_pseudo_labels = ema_sim_logits.argmax(dim=-1)  # 通过 argmax 获取最大相似度对应的类别标签
+            # feature_dict['ema_similarity_logits'] = ema_sim_logits  # 存储 EMA 相似度 logits
+            # feature_dict['ema_pseudo_labels'] = ema_pseudo_labels  # 存储基于 EMA 的伪标签
 
+            return end_points, feature_dict  # 返回 end_points 和特征字典
         return end_points
 
 
