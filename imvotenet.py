@@ -28,6 +28,8 @@ from config import get_flags, global_flag
 
 import torch.nn.functional as F  # Add this line with other imports
 
+import copy
+
 FLAGS = get_flags(global_flag)
 if FLAGS.dataset == 'sunrgbd':
     sys.path.append(os.path.join(ROOT_DIR, 'sunrgbd'))
@@ -93,7 +95,8 @@ class ImVoteNet(nn.Module):
 
     def __init__(self, num_class, num_heading_bin, num_size_cluster, mean_size_arr,
                  input_feature_dim=0, num_proposal=128, vote_factor=1, sampling='vote_fps',
-                 max_imvote_per_pixel=3, image_feature_dim=18, image_hidden_dim=256,output_distill_weight=0.5, feat_distill_weight=1.0, use_distillation=True):
+                 max_imvote_per_pixel=3, image_feature_dim=18, image_hidden_dim=256, output_distill_weight=0.5,
+                 feat_distill_weight=1.0, use_distillation=True, ema_decay=0.99):
         super().__init__()
 
         self.num_class = num_class
@@ -143,23 +146,27 @@ class ImVoteNet(nn.Module):
         self.feat_distill_weight = feat_distill_weight
         self.use_distillation = use_distillation
 
-    # def initialize_ema_model(self):
-    #     """ 使用 deepcopy 初始化 EMA 模型 """
-    #     self.ema_model = copy.deepcopy(self)
-    #     self.ema_model.eval()
-    #     for param in self.ema_model.parameters():
-    #         param.requires_grad = False
-    #
-    # def update_ema_model(self, alpha=None):
-    #     """ EMA 参数更新 """
-    #     if self.ema_model is None:
-    #         return
-    #
-    #     if alpha is None:
-    #         alpha = self.ema_decay
-    #
-    #     for ema_param, param in zip(self.ema_model.parameters(), self.parameters()):
-    #         ema_param.data.mul_(alpha).add_(param.data * (1 - alpha))
+        self.ema_decay = ema_decay
+
+        self.ema_model = None
+
+    def initialize_ema_model(self):
+        """ 使用 deepcopy 初始化 EMA 模型 """
+        self.ema_model = copy.deepcopy(self)
+        self.ema_model.eval()
+        for param in self.ema_model.parameters():
+            param.requires_grad = False
+
+    def update_ema_model(self, alpha=None):
+        """ EMA 参数更新 """
+        if self.ema_model is None:
+            return
+
+        if alpha is None:
+            alpha = self.ema_decay
+
+        for ema_param, param in zip(self.ema_model.parameters(), self.parameters()):
+            ema_param.data.mul_(alpha).add_(param.data * (1 - alpha))
 
     def batch_encode_text(self, text):
         batch_size = 20
@@ -188,7 +195,7 @@ class ImVoteNet(nn.Module):
         # 将传入的tower_weights保存为类的成员变量
         self.tower_weights = tower_weights
 
-    def forward(self, inputs, joint_only=False,return_features=False):
+    def forward(self, inputs, joint_only=False, return_features=False):
         """ Forward pass of the network
 
         Args:
@@ -277,6 +284,12 @@ class ImVoteNet(nn.Module):
         end_points = self.pc_img_pnet(vote_xyz, vote_features, end_points)
 
         if return_features:
+            # 初始化 EMA 模型（如果没有初始化）
+            if self.ema_model is None:
+                self.initialize_ema_model()
+
+            # 更新 EMA 模型
+            self.update_ema_model(alpha=0.99)
             # 创建一个字典存储特征信息
             feature_dict = {
                 'backbone_features': end_points['fp2_features'],  # 上采样后的 backbone 特征
@@ -295,7 +308,6 @@ class ImVoteNet(nn.Module):
             text_feats = self.text_feats_2Dsemantic  # 文本特征（预训练好的 2D 语义特征）
             text_feats = F.normalize(text_feats, dim=1)  # 按行进行归一化
 
-
             # 展平 vote_features，形状为 [B*N, C]，用于后续计算相似度
             vote_features_flat = vote_features.permute(0, 2, 1).reshape(-1, C)  # 转置并展平
             vote_features_flat = F.normalize(vote_features_flat, dim=1)  # 对投票特征进行归一化
@@ -307,29 +319,36 @@ class ImVoteNet(nn.Module):
             # 生成基于相似度的伪标签（取相似度最大的类别索引）
             pseudo_labels_sim = sim_logits.argmax(dim=-1)  # 通过 argmax 获取最大相似度对应的类别标签
             feature_dict['similarity_logits'] = sim_logits  # 存储相似度 logits
-            
+
             feature_dict['sim_pseudo_labels'] = pseudo_labels_sim  # 存储基于相似度的伪标签
 
-            # # 生成基于 EMA 模型的伪标签
-            # ema_vote_features = self.ema_model.pc_img_vgen(end_points['seed_xyz'], joint_features)[1]  # 从 EMA 模型生成投票特征
-            # ema_vote_features = F.normalize(ema_vote_features, p=2, dim=1)  # 对 EMA 投票特征进行归一化
-            #
-            # # 展平 EMA 投票特征并进行归一化
-            # ema_vote_features_flat = ema_vote_features.permute(0, 2, 1).reshape(-1, C)  # 转置并展平
-            # ema_vote_features_flat = F.normalize(ema_vote_features_flat, dim=1)  # 对 EMA 投票特征进行归一化
-            #
-            # # 计算 EMA 投票特征与文本特征的相似度（内积计算）
-            # ema_sim_logits = torch.matmul(ema_vote_features_flat, text_feats.float().T)  # 计算 EMA 相似度 logits
-            # ema_sim_logits = ema_sim_logits.view(B, N, -1)  # 重塑形状为 [B, N, num_classes]
-            #
-            # # 生成基于 EMA 的伪标签（取相似度最大的类别索引）
-            # ema_pseudo_labels = ema_sim_logits.argmax(dim=-1)  # 通过 argmax 获取最大相似度对应的类别标签
-            # feature_dict['ema_similarity_logits'] = ema_sim_logits  # 存储 EMA 相似度 logits
-            # feature_dict['ema_pseudo_labels'] = ema_pseudo_labels  # 存储基于 EMA 的伪标签
+            # -------- EMA伪标签处理 --------
+            if self.ema_model is not None:
+                # print("Generating EMA pseudo labels...")
+
+                # 从 EMA 模型生成投票特征
+                ema_vote_features = self.ema_model.pc_img_vgen(end_points['seed_xyz'], joint_features)[1]
+                ema_vote_features = F.normalize(ema_vote_features, p=2, dim=1)
+
+                # 展平并归一化
+                ema_vote_features_flat = ema_vote_features.permute(0, 2, 1).reshape(-1, C)
+                ema_vote_features_flat = F.normalize(ema_vote_features_flat, dim=1)
+
+                # 与文本特征计算相似度
+                ema_sim_logits = torch.matmul(ema_vote_features_flat, text_feats.float().T)
+                ema_sim_logits = ema_sim_logits.view(B, N, -1)
+
+                # argmax生成伪标签
+                ema_pseudo_labels = ema_sim_logits.argmax(dim=-1)
+
+                # 存入feature_dict
+                feature_dict['ema_similarity_logits'] = ema_sim_logits
+                feature_dict['ema_pseudo_labels'] = ema_pseudo_labels
+            else:
+                print("Warning: ema_model is None, skipping EMA pseudo-label generation.")
 
             return end_points, feature_dict  # 返回 end_points 和特征字典
         return end_points
-
 
 # 返回的 feature_dict 结构说明：
 #
