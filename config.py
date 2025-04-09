@@ -45,6 +45,8 @@ def get_flags_train():
                        help='Weight for feature distillation loss')
     parser.add_argument('--pseudo_label_weight', type=float, default=0.5,
                        help='Weight for pseudo_label distillation loss')
+    parser.add_argument('--relation_distill_weight', type=float, default=0.5,
+                        help='Weight for relation distillation loss')
 
     # 支持 'sim'（vote-to-text），'ema'（EMA伪标签），或 'fused'（置信度融合）
     parser.add_argument('--ema_pseudo_source', type=str, default='fused',
