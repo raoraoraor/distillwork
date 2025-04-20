@@ -8,7 +8,6 @@
 Author: Charles R. Qi, Xinlei Chen and Or Litany
 """
 
-
 import torch
 import torch.nn as nn
 import numpy as np
