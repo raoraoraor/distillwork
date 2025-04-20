@@ -4,7 +4,7 @@ import numpy as np
 from datetime import datetime
 import argparse
 from config import get_flags
-
+#
 
 FLAGS = get_flags(flag_train=True)
 import importlib
@@ -30,6 +30,13 @@ from ap_helper import APCalculator, parse_predictions, parse_groundtruths
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import torch.nn.functional as F  # 引用包报错添加
+
+
+import wandb
+
+wandb.login(key="1729dc06a1cea72bca2d6044ead8af11a2555e1a")
+
+counter = 0
 
 # GLOBAL CONFIG
 BATCH_SIZE = FLAGS.batch_size
@@ -234,6 +241,8 @@ def RelationDistillationLoss(student_features, teacher_features, lambda_relation
 def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATALOADER,
                     student_tower_weights, teacher_tower_weights,
                     teacher_model=None, ema_model=None, strategy='fused', epoch=None):
+    global counter  # 添加这一行
+    
     stat_dict = {}
     net.train()
 
@@ -391,11 +400,24 @@ def train_one_epoch(net, MODEL, criterion, optimizer, bnm_scheduler, TRAIN_DATAL
             # ✅ 用 tqdm.write 替代 log_string，避免破坏进度条 (ok的)
             tqdm.write(log_str)
 
+        counter = counter + 1
+        if is_primary() and FLAGS.if_wandb:
+            wandb.log({
+                f"train/{k}": v for k, v in {
+                    "total_loss": total_loss.item(),
+                    "original_loss": original_loss.item(),
+                    "distill_loss": distill_loss.item() if teacher_model else 0.0,
+                    "feat_distill_loss": feat_distill_loss.item() if teacher_model else 0.0,
+                    "pseudo_label_loss": pseudo_label_loss,
+                    "relation_distill_loss": relation_distill_loss.item()
+                }.items()
+            }, step=counter)
         # 更新进度条
         progress.update(1)
         progress.set_postfix({"loss": total_loss.item()})
 
     progress.close()
+
 
     # Save checkpoint logic here:
     barrier()
@@ -533,11 +555,20 @@ def train_or_evaluate(start_epoch, net, MODEL, net_no_ddp, criterion, optimizer,
             epoch=epoch
         )
 
-        if is_primary() and FLAGS.if_wandb:
-            for key_prefix in KEY_PREFIX_LIST:
-                if key_prefix in stat_dict_loss:
-                    average = sum(stat_dict_loss[key_prefix]) / len(stat_dict_loss[key_prefix])
-                    wandb.log({f"train/{key_prefix}_loss": average}, step=epoch)
+        LOSS_KEYS = [
+            "total_loss",
+            "original_loss",
+            "distill_loss",
+            "feat_distill_loss",
+            "pseudo_label_loss",
+            "relation_distill_loss"
+        ]
+
+        # if is_primary() and FLAGS.if_wandb:
+        #     for loss_name in LOSS_KEYS:
+        #         if loss_name in stat_dict_loss:
+        #             average = sum(stat_dict_loss[loss_name]) / len(stat_dict_loss[loss_name])
+        #             wandb.log({f"train/{loss_name}": average}, step=epoch)
 
         # Save checkpoint
         save_dict = {
@@ -550,8 +581,8 @@ def train_or_evaluate(start_epoch, net, MODEL, net_no_ddp, criterion, optimizer,
         except:
             save_dict['model_state_dict'] = net.state_dict()
 
-        # 更改了eval的顺序，先检查ckpt是否能够保存，然后再检查是否能够成功完成对应的验证
-        loss, mAP_LIST = evaluate_one_epoch(net, MODEL, criterion, optimizer, TRAIN_DATALOADER, TEST_DATALOADER, epoch)
+        # # 更改了eval的顺序，先检查ckpt是否能够保存，然后再检查是否能够成功完成对应的验证
+        # loss, mAP_LIST = evaluate_one_epoch(net, MODEL, criterion, optimizer, TRAIN_DATALOADER, TEST_DATALOADER, epoch)
 
         if is_primary():
             torch.save(save_dict, os.path.join(LOG_DIR, f'checkpoint.tar'))
@@ -561,14 +592,14 @@ def train_or_evaluate(start_epoch, net, MODEL, net_no_ddp, criterion, optimizer,
                 save_path = os.path.join(LOG_DIR, f'checkpoint.tar')
                 print(f"Saving checkpoint to: {save_path}")
                 torch.save(save_dict, os.path.join(LOG_DIR, f'checkpoint_{EPOCH_CNT}.tar'))
-            for i, mAP in enumerate(mAP_LIST):
-                if mAP > max_mAP[i]:
-                    max_mAP[i] = mAP
-                    if not os.path.exists(LOG_DIR):
-                        os.makedirs(LOG_DIR)
-                    save_path = os.path.join(LOG_DIR, f'checkpoint.tar')
-                    print(f"Saving checkpoint to: {save_path}")
-                    torch.save(save_dict, os.path.join(LOG_DIR, f'checkpoint_best_mAP_dataset_in_{FLAGS.dataset}.tar'))
+            # for i, mAP in enumerate(mAP_LIST):
+            #     if mAP > max_mAP[i]:
+            #         max_mAP[i] = mAP
+            #         if not os.path.exists(LOG_DIR):
+            #             os.makedirs(LOG_DIR)
+            #         save_path = os.path.join(LOG_DIR, f'checkpoint.tar')
+            #         print(f"Saving checkpoint to: {save_path}")
+            #         torch.save(save_dict, os.path.join(LOG_DIR, f'checkpoint_best_mAP_dataset_in_{FLAGS.dataset}.tar'))
 
 
 # Init datasets and dataloaders
