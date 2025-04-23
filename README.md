@@ -23,6 +23,8 @@ https://arxiv.org/pdf/2407.10164
 Fusion-then-Distillation: Toward Cross-modal Positive Distillation for Domain Adaptive 3D Semantic Segmentation  
 https://arxiv.org/pdf/2410.19446
 
+## 2025/04/23修改注意
+我们ImvoteNet.py的forward前向传播里面的特征提取代码重复了... 怪不得会有问题，需要删掉重复的地方
 
 A Comprehensive Survey on Knowledge Distillation(2025最新综述)  
 https://arxiv.org/pdf/2503.12067
