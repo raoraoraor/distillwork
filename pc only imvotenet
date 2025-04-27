@@ -232,8 +232,6 @@ class ImVoteNet(nn.Module):
         img_features = features[:, 256:, :]
         img_features = self.image_mlp(img_features)
         joint_features = torch.cat((pc_features, img_features), 1)
-        print("img_features维度:", img_features.shape)  # 检查MLP输出维度
-        print("pc_features维度:",pc_features.shape)
 
         # 1. Backbone特征提取
         end_points = self.backbone_net(inputs['point_clouds'], end_points)
@@ -277,26 +275,25 @@ class ImVoteNet(nn.Module):
             end_points = self.pc_only_pnet(xyz, features, end_points)
 
         # # --------- JOINT TOWER ---------
-        prefix = 'pc_img_'
-        print('pc_img_')
-        xyz, features = self.pc_img_vgen(end_points['seed_xyz'], joint_features)
-        features_norm = torch.norm(features, p=2, dim=1)
-        features = features.div(features_norm.unsqueeze(1))
-        print(features.shape)
-        end_points[prefix + 'vote_xyz'] = xyz
-        end_points[prefix + 'vote_features'] = features
-        end_points = self.pc_img_pnet(xyz, features, end_points)
-        
-        end_points = self.pc_img_pnet(vote_xyz, vote_features, end_points)
-        # --------- POINTS-ONLY TOWER ---------
-        # prefix = 'pc_only_'
-        # # print("pc_only_")
-        # xyz, features = self.pc_only_vgen(end_points['seed_xyz'], pc_features)
+        # prefix = 'pc_img_'
+        # print('pc_img_')
+        # xyz, features = self.pc_img_vgen(end_points['seed_xyz'], joint_features)
         # features_norm = torch.norm(features, p=2, dim=1)
         # features = features.div(features_norm.unsqueeze(1))
         # end_points[prefix + 'vote_xyz'] = xyz
         # end_points[prefix + 'vote_features'] = features
-        # end_points = self.pc_only_pnet(xyz, features, end_points)
+        # end_points = self.pc_img_pnet(xyz, features, end_points)
+        # 
+        # end_points = self.pc_img_pnet(vote_xyz, vote_features, end_points)
+        # --------- POINTS-ONLY TOWER ---------
+        prefix = 'pc_only_'
+        # print("pc_only_")
+        xyz, features = self.pc_only_vgen(end_points['seed_xyz'], pc_features)
+        features_norm = torch.norm(features, p=2, dim=1)
+        features = features.div(features_norm.unsqueeze(1))
+        end_points[prefix + 'vote_xyz'] = xyz
+        end_points[prefix + 'vote_features'] = features
+        end_points = self.pc_only_pnet(xyz, features, end_points)
 
         if return_features:
             # 初始化 EMA 模型（如果没有初始化）
@@ -336,10 +333,6 @@ class ImVoteNet(nn.Module):
             feature_dict['similarity_logits'] = sim_logits  # 存储相似度 logits
 
             feature_dict['sim_pseudo_labels'] = pseudo_labels_sim  # 存储基于相似度的伪标签
-            
-            feature_dict['img_features'] = img_features
-            
-            feature_dict['pc_features'] = pc_features
 
             # -------- EMA伪标签处理 --------
             if self.ema_model is not None:
