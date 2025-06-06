@@ -29,4 +29,7 @@ https://arxiv.org/pdf/2503.12067
 
 ## 2025/04/23修改注意
 我们ImvoteNet.py的forward前向传播里面的特征提取代码重复了... 怪不得会有问题，需要删掉重复的地方
+
+## 2025/04/27
+由于操作不当，我把上传时间给重置了。。。adapter部分一共更新了imvotenet_new,distill_rao（主程序）,adapter_net（新）三个文件
   
